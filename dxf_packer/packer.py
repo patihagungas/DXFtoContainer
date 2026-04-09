@@ -185,16 +185,20 @@ def _insert_dunnage(
     log_cross: float,
     container: Container,
 ) -> list[SpacerLog]:
-    """Insert floor dunnage logs under each floor-level item.
+    """Insert dunnage logs under every placed item (floor and stacked).
 
-    Two logs per item, running along the item's longest axis, placed at 25%
-    and 75% of the perpendicular axis.  The logs are sized to fit inside the
-    clearance gap below the actual mesh (clearance/2 tall, clamped to log_cross).
+    Two logs per item running along the WIDTH axis (Y), spaced at 25 % and
+    75 % of the item's length (X).  Each log sits in the clearance gap directly
+    below the actual mesh, so its height equals exactly clearance/2 — the
+    tightest fit that keeps items separated.
+
+    The log cross-section along X is min(log_cross, clearance/2) so it always
+    stays inside the gap and never touches adjacent items.
 
     Args:
         placed: All placed items.
-        log_cross: Requested log cross-section (mm). Clamped to clearance/2.
-        container: Container dimensions.
+        log_cross: Nominal log width along X (mm). Clamped to clearance/2.
+        container: Container dimensions (used only for boundary clamping).
 
     Returns:
         List of SpacerLog objects.
@@ -203,48 +207,40 @@ def _insert_dunnage(
 
     for item in placed:
         half_c = item.clearance / 2.0
-        # Only place floor logs when the item sits on (or near) the container floor
-        if item.position[2] > half_c + 1.0:
-            continue
+        if half_c < 1.0:
+            continue  # no usable gap
 
-        # Log height is limited to the clearance gap below the actual mesh
-        log_h = min(log_cross, max(half_c, 1.0))
+        # Log sits in the clearance gap below the actual mesh
+        log_z = item.position[2]          # bottom of inflated AABB
+        log_h = half_c                    # fills gap exactly, minimum possible
 
-        # Actual mesh footprint (not the inflated box)
-        ap = item.actual_position        # (x, y, z) of actual mesh min corner
-        ae = item.extents                # actual extents
+        # Log runs along Y (width).  Cross-section width along X is clamped
+        # so it never exceeds the gap.
+        log_w = min(log_cross, half_c)    # extent along X
 
+        # Actual mesh footprint
+        ap = item.actual_position         # (x, y, z) min corner of actual mesh
+        ae = item.extents                 # actual extents
+
+        # Clamp to container bounds
         ax0 = max(ap[0], 0.0)
-        ay0 = max(ap[1], 0.0)
         ax1 = min(ap[0] + ae[0], container.length)
+        ay0 = max(ap[1], 0.0)
         ay1 = min(ap[1] + ae[1], container.width)
 
-        if ae[0] >= ae[1]:
-            # Longest axis is X → logs run along X, spaced along Y
-            log_len = ax1 - ax0
-            if log_len <= 0:
-                continue
-            for frac in (0.25, 0.75):
-                log_y = ay0 + (ay1 - ay0) * frac - log_cross / 2.0
-                log_y = max(0.0, min(log_y, container.width - log_cross))
-                logs.append(SpacerLog(
-                    position=np.array([ax0, log_y, 0.0]),
-                    extents=np.array([log_len, log_cross, log_h]),
-                    label="floor dunnage",
-                ))
-        else:
-            # Longest axis is Y → logs run along Y, spaced along X
-            log_len = ay1 - ay0
-            if log_len <= 0:
-                continue
-            for frac in (0.25, 0.75):
-                log_x = ax0 + (ax1 - ax0) * frac - log_cross / 2.0
-                log_x = max(0.0, min(log_x, container.length - log_cross))
-                logs.append(SpacerLog(
-                    position=np.array([log_x, ay0, 0.0]),
-                    extents=np.array([log_cross, log_len, log_h]),
-                    label="floor dunnage",
-                ))
+        log_len = ay1 - ay0   # runs along Y
+        if log_len <= 0 or ax1 - ax0 <= 0:
+            continue
+
+        # Two logs at 25 % and 75 % of the item's X span
+        for frac in (0.25, 0.75):
+            log_x = ax0 + (ax1 - ax0) * frac - log_w / 2.0
+            log_x = max(ax0, min(log_x, ax1 - log_w))  # stay inside item footprint
+            logs.append(SpacerLog(
+                position=np.array([log_x, ay0, log_z]),
+                extents=np.array([log_w, log_len, log_h]),
+                label="dunnage",
+            ))
 
     return logs
 
@@ -352,31 +348,17 @@ class Packer:
 
         return best
 
-    def pack(
+    def _pack_flat(
         self,
-        assemblies: list[Assembly],
+        items: list[Assembly],
         fine_rotations: bool = False,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> PackingResult:
-        """Pack all assembly instances into the container.
+        """Pack a pre-expanded, pre-sorted flat list of Assembly objects.
 
-        Args:
-            assemblies: List of Assembly objects (each with a .quantity).
-            fine_rotations: If True, also try 15° Z-rotation steps.
-            progress_callback: Optional callable(current, total) for progress UI.
-
-        Returns:
-            PackingResult with placed items, dunnage logs, utilization, etc.
+        Internal helper — does not expand by quantity.
         """
         t0 = time.perf_counter()
-
-        # Expand by quantity, sort largest volume first (BFFD)
-        items: list[Assembly] = []
-        for asm in assemblies:
-            for _ in range(max(1, asm.quantity)):
-                items.append(asm)
-        items.sort(key=lambda a: a.volume, reverse=True)
-
         placed: list[PlacedItem] = []
         unpacked: list[Assembly] = []
         total = len(items)
@@ -385,7 +367,6 @@ class Packer:
             if progress_callback:
                 progress_callback(idx, total)
 
-            # Build rotation list
             rots: list[np.ndarray] = (
                 axis_aligned_rotations() if asm.allow_tipping else upright_rotations()
             )
@@ -400,18 +381,13 @@ class Packer:
                 log.info("Could not place '%s'", asm.name)
             else:
                 placed.append(item)
-                log.debug(
-                    "Placed '%s' at %s", asm.name, np.round(item.position, 1)
-                )
+                log.debug("Placed '%s' at %s", asm.name, np.round(item.position, 1))
 
         logs = _insert_dunnage(placed, self.log_cross_mm, self.container)
-
         packed_vol = sum(p.assembly.volume for p in placed)
         utilization = packed_vol / self.container.volume if self.container.volume > 0 else 0.0
-
         weights = [p.assembly.weight_kg for p in placed if p.assembly.weight_kg is not None]
         total_weight: Optional[float] = sum(weights) if weights else None
-
         collisions = _check_collisions(placed)
         elapsed = time.perf_counter() - t0
 
@@ -428,3 +404,65 @@ class Packer:
             collisions=collisions,
             elapsed_sec=elapsed,
         )
+
+    def pack(
+        self,
+        assemblies: list[Assembly],
+        fine_rotations: bool = False,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> PackingResult:
+        """Pack all assembly instances into the container.
+
+        Args:
+            assemblies: List of Assembly objects (each with a .quantity).
+            fine_rotations: If True, also try 15° Z-rotation steps.
+            progress_callback: Optional callable(current, total) for progress UI.
+
+        Returns:
+            PackingResult with placed items, dunnage logs, utilization, etc.
+        """
+        items: list[Assembly] = []
+        for asm in assemblies:
+            for _ in range(max(1, asm.quantity)):
+                items.append(asm)
+        items.sort(key=lambda a: a.volume, reverse=True)
+        return self._pack_flat(items, fine_rotations, progress_callback)
+
+    def pack_all(
+        self,
+        assemblies: list[Assembly],
+        fine_rotations: bool = False,
+        max_containers: int = 20,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> list[PackingResult]:
+        """Pack all assemblies, spilling into additional containers as needed.
+
+        Args:
+            assemblies: List of Assembly objects (each with a .quantity).
+            fine_rotations: If True, also try 15° Z-rotation steps.
+            max_containers: Safety cap on the number of containers created.
+            progress_callback: Optional callable(current, total) for progress UI.
+
+        Returns:
+            List of PackingResult, one per container used.
+        """
+        # Expand by quantity once, sort largest-first
+        items: list[Assembly] = []
+        for asm in assemblies:
+            for _ in range(max(1, asm.quantity)):
+                items.append(asm)
+        items.sort(key=lambda a: a.volume, reverse=True)
+
+        all_results: list[PackingResult] = []
+        container_num = 0
+
+        while items and container_num < max_containers:
+            result = self._pack_flat(items, fine_rotations, progress_callback)
+            all_results.append(result)
+            # Stop if nothing was placed (items are too big for this container)
+            if not result.unpacked or len(result.placed) == 0:
+                break
+            items = result.unpacked
+            container_num += 1
+
+        return all_results

@@ -73,31 +73,47 @@ class Viewport3D(QWidget):
         result: "PackingResult",
         container: "Container",
     ) -> None:
-        """Render a full packing result.
+        """Render a single packing result."""
+        self.render_multi_results([(result, container)])
+
+    def render_multi_results(
+        self,
+        results_containers: list[tuple["PackingResult", "Container"]],
+    ) -> None:
+        """Render multiple containers laid out side-by-side along X.
 
         Args:
-            result: Packing result with placed items and logs.
-            container: Container dimensions.
+            results_containers: List of (PackingResult, Container) pairs.
         """
         if not HAS_GL or self._view is None:
             return
 
-        self._result = result
-        self._container = container
-        self._placed_items = result.placed
+        self._placed_items = []
         self._selected_idx = None
-
         self._clear_scene()
-        self._draw_container(container)
 
-        for idx, item in enumerate(result.placed):
-            self._draw_item(item, idx)
+        GAP = 1000.0  # mm between containers
+        offset_x = 0.0
 
-        for log_box in result.logs:
-            self._draw_log(log_box)
+        for result, container in results_containers:
+            offset = np.array([offset_x, 0.0, 0.0])
 
-        self._draw_grid(container)
-        self._centre_camera(container)
+            self._draw_container(container, offset)
+
+            for item in result.placed:
+                self._draw_item(item, len(self._placed_items), offset)
+                self._placed_items.append(item)
+
+            for log_box in result.logs:
+                self._draw_log(log_box, offset)
+
+            self._draw_grid(container, offset)
+            offset_x += container.length + GAP
+
+        # Centre camera to frame all containers
+        total_length = offset_x - GAP
+        first_container = results_containers[0][1]
+        self._centre_camera_multi(total_length, first_container)
 
     def clear_scene(self) -> None:
         """Remove all rendered items."""
@@ -123,10 +139,12 @@ class Viewport3D(QWidget):
             self._view.removeItem(item)
         self._mesh_items = []
 
-    def _draw_container(self, container: "Container") -> None:
+    def _draw_container(self, container: "Container", offset: np.ndarray = None) -> None:
         """Draw the container as a white wireframe box."""
+        if offset is None:
+            offset = np.zeros(3)
         l, w, h = container.length, container.width, container.height
-        verts, edges = _box_wireframe(np.zeros(3), np.array([l, w, h]))
+        verts, edges = _box_wireframe(offset, np.array([l, w, h]))
         lines = _edges_to_lines(verts, edges)
         line_item = gl.GLLinePlotItem(
             pos=lines,
@@ -137,16 +155,15 @@ class Viewport3D(QWidget):
         )
         self._view.addItem(line_item)
 
-    def _draw_item(self, item: "PlacedItem", idx: int) -> None:
+    def _draw_item(self, item: "PlacedItem", idx: int, offset: np.ndarray = None) -> None:
         """Draw a placed assembly as a coloured solid mesh."""
+        if offset is None:
+            offset = np.zeros(3)
         mesh = item.assembly.mesh.copy()
 
-        # Rotate then translate to actual (non-inflated) position.
-        # The rotation is applied around the mesh origin (min corner),
-        # then the mesh is shifted to actual_position (= inflated pos + clearance/2).
         t = np.eye(4, dtype=np.float64)
         t[:3, :3] = item.rotation
-        t[:3, 3] = item.actual_position
+        t[:3, 3] = item.actual_position + offset
         mesh.apply_transform(t)
 
         verts = mesh.vertices.astype(np.float32)
@@ -167,9 +184,11 @@ class Viewport3D(QWidget):
         self._view.addItem(mesh_item)
         self._mesh_items.append(mesh_item)
 
-    def _draw_log(self, log_box) -> None:
+    def _draw_log(self, log_box, offset: np.ndarray = None) -> None:
         """Draw a spacer log as a brown solid box."""
-        pos = log_box.position
+        if offset is None:
+            offset = np.zeros(3)
+        pos = log_box.position + offset
         ext = log_box.extents
         verts, faces = _box_solid(pos, ext)
 
@@ -187,19 +206,23 @@ class Viewport3D(QWidget):
         mesh_item.setGLOptions("opaque")
         self._view.addItem(mesh_item)
 
-    def _draw_grid(self, container: "Container") -> None:
+    def _draw_grid(self, container: "Container", offset: np.ndarray = None) -> None:
         """Draw a subtle floor grid."""
+        if offset is None:
+            offset = np.zeros(3)
+        ox = offset[0]
+        oy = offset[1]
         step = max(500, int(min(container.length, container.width) / 10 / 100) * 100)
         lines = []
         for x in range(0, int(container.length) + step, step):
             lines.extend([
-                [x, 0, 0], [x, container.width, 0],
-                [x, container.width, 0], [x, 0, 0],  # duplicate to close line
+                [ox + x, oy, 0], [ox + x, oy + container.width, 0],
+                [ox + x, oy + container.width, 0], [ox + x, oy, 0],
             ])
         for y in range(0, int(container.width) + step, step):
             lines.extend([
-                [0, y, 0], [container.length, y, 0],
-                [container.length, y, 0], [0, y, 0],
+                [ox, oy + y, 0], [ox + container.length, oy + y, 0],
+                [ox + container.length, oy + y, 0], [ox, oy + y, 0],
             ])
 
         if lines:
@@ -213,13 +236,16 @@ class Viewport3D(QWidget):
             self._view.addItem(grid_item)
 
     def _centre_camera(self, container: "Container") -> None:
-        """Position the camera to frame the container nicely."""
+        """Position the camera to frame a single container."""
+        self._centre_camera_multi(container.length, container)
+
+    def _centre_camera_multi(self, total_length: float, ref_container: "Container") -> None:
+        """Position the camera to frame all containers."""
         import pyqtgraph as pg
-        cx = container.length / 2
-        cy = container.width / 2
-        cz = container.height / 2
-        dist = max(container.length, container.width, container.height) * 1.8
-        # Set the orbit centre to the middle of the container
+        cx = total_length / 2
+        cy = ref_container.width / 2
+        cz = ref_container.height / 2
+        dist = max(total_length, ref_container.width, ref_container.height) * 1.8
         self._view.opts["center"] = pg.Vector(cx, cy, cz)
         self._view.setCameraPosition(distance=dist, elevation=25, azimuth=45)
 

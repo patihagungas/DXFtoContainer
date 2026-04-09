@@ -21,7 +21,9 @@ from .viewport import Viewport3D
 from ..assembly import load_assembly
 from ..packer import Packer, PackingResult
 from ..container import Container
-from ..exporter import export_dxf, export_json, export_csv, export_pdf
+from ..exporter import (
+    export_dxf_multi, export_json_multi, export_csv_multi, export_pdf_multi,
+)
 from ..utils import color_palette
 
 log = logging.getLogger(__name__)
@@ -63,12 +65,12 @@ class PackWorker(QObject):
                 log_cross_mm=self.log_cross,
                 optimize_mode=self.optimize_mode,
             )
-            result = packer.pack(
+            results = packer.pack_all(
                 self.assemblies,
                 fine_rotations=self.fine_rotations,
                 progress_callback=lambda cur, tot: self.progress.emit(cur, tot),
             )
-            self.finished.emit(result)
+            self.finished.emit(results)
         except Exception as exc:
             log.exception("Packing failed")
             self.error.emit(f"Packing failed:\n{exc}\n\n{traceback.format_exc()}")
@@ -87,7 +89,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
 
         self._assemblies: list = []
-        self._result: Optional[PackingResult] = None
+        self._results: list[PackingResult] = []
         self._container: Optional[Container] = None
         self._worker: Optional[PackWorker] = None
         self._thread: Optional[QThread] = None
@@ -275,44 +277,54 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._thread.quit)
         self._thread.start()
 
-    def _on_pack_done(self, result: PackingResult) -> None:
-        self._result = result
+    def _on_pack_done(self, results: list) -> None:
+        self._results = results
         self.progress_bar.setVisible(False)
         self.right_panel.btn_pack.setEnabled(True)
-        self.right_panel.enable_export_buttons(True)
+        self.right_panel.enable_export_buttons(bool(results))
 
-        # Render
-        self.viewport.render_result(result, self._container)
+        if not results:
+            self._set_status("Packing produced no results.")
+            return
 
-        # Status
-        total_qty = sum(a.quantity for a in self.left_panel.get_active_assemblies())
-        weight_str = (
-            f"  |  {result.total_weight_kg:.1f} kg" if result.total_weight_kg else ""
+        # Render all containers side-by-side
+        self.viewport.render_multi_results(
+            [(r, self._container) for r in results]
         )
+
+        total_placed = sum(len(r.placed) for r in results)
+        total_qty = sum(a.quantity for a in self.left_panel.get_active_assemblies())
+        last_result = results[-1]
+        all_collisions = [c for r in results for c in r.collisions]
+
+        weight_vals = [r.total_weight_kg for r in results if r.total_weight_kg]
+        weight_str = f"  |  {sum(weight_vals):.1f} kg" if weight_vals else ""
         collision_str = (
-            f"  |  ⚠ {len(result.collisions)} collision(s)" if result.collisions else ""
+            f"  |  ⚠ {len(all_collisions)} collision(s)" if all_collisions else ""
+        )
+        container_str = (
+            f"  |  {len(results)} container{'s' if len(results) > 1 else ''}"
         )
         self._set_status(
-            f"Packed {len(result.placed)}/{total_qty} items  "
-            f"|  Utilization: {result.utilization*100:.1f}%  "
-            f"|  {result.elapsed_sec:.2f}s"
+            f"Packed {total_placed}/{total_qty} items"
+            f"{container_str}"
             f"{weight_str}{collision_str}"
         )
 
-        if result.collisions:
+        if all_collisions:
             QMessageBox.warning(
                 self, "Collision Detected",
                 "Post-packing collision check found overlapping items:\n\n" +
-                "\n".join(result.collisions[:5])
+                "\n".join(all_collisions[:5])
             )
 
-        if result.unpacked:
-            names = ", ".join(a.name for a in result.unpacked[:5])
-            if len(result.unpacked) > 5:
-                names += f" (+{len(result.unpacked)-5} more)"
+        if last_result.unpacked:
+            names = ", ".join(a.name for a in last_result.unpacked[:5])
+            if len(last_result.unpacked) > 5:
+                names += f" (+{len(last_result.unpacked)-5} more)"
             QMessageBox.information(
                 self, "Some Items Not Placed",
-                f"The following items did not fit in the container:\n{names}"
+                f"The following items could not be placed in any container:\n{names}"
             )
 
     def _on_pack_error(self, msg: str) -> None:
@@ -337,46 +349,52 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _export_dxf(self) -> None:
-        if not self._result:
+        if not self._results:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export DXF", "packing_result.dxf", "DXF Files (*.dxf)"
         )
         if path:
             try:
-                export_dxf(self._result, self._container, path)
+                export_dxf_multi(
+                    [(r, self._container) for r in self._results], path
+                )
                 self._set_status(f"DXF exported: {path}")
             except Exception as exc:
                 QMessageBox.critical(self, "Export Error", str(exc))
 
     def _export_json(self) -> None:
-        if not self._result:
+        if not self._results:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export JSON", "packing_result.json", "JSON Files (*.json)"
         )
         if path:
             try:
-                export_json(self._result, self._container, path)
+                export_json_multi(
+                    [(r, self._container) for r in self._results], path
+                )
                 self._set_status(f"JSON exported: {path}")
             except Exception as exc:
                 QMessageBox.critical(self, "Export Error", str(exc))
 
     def _export_csv(self) -> None:
-        if not self._result:
+        if not self._results:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export CSV", "packing_result.csv", "CSV Files (*.csv)"
         )
         if path:
             try:
-                export_csv(self._result, path)
+                export_csv_multi(
+                    [(r, self._container) for r in self._results], path
+                )
                 self._set_status(f"CSV exported: {path}")
             except Exception as exc:
                 QMessageBox.critical(self, "Export Error", str(exc))
 
     def _export_pdf(self) -> None:
-        if not self._result:
+        if not self._results:
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export PDF", "packing_report.pdf", "PDF Files (*.pdf)"
@@ -389,7 +407,9 @@ class MainWindow(QMainWindow):
                     sc_path = str(Path(path).with_suffix(".viewport.png"))
                     img.save(sc_path)
                     screenshot = sc_path
-                export_pdf(self._result, self._container, path, screenshot)
+                export_pdf_multi(
+                    [(r, self._container) for r in self._results], path, screenshot
+                )
                 self._set_status(f"PDF exported: {path}")
             except Exception as exc:
                 QMessageBox.critical(self, "Export Error", str(exc))
