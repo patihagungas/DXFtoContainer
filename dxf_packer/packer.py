@@ -1,12 +1,16 @@
 """3D bin packing — Boundary-Point Best-Fit Decreasing.
 
 Key improvements over naive extreme-point:
-  - Candidate positions are the full Cartesian product of all X/Y face boundaries,
-    giving O(n²) positions instead of O(n) → far fewer gaps.
+  - Candidate positions are the full Cartesian product of ALL X/Y face boundaries
+    (left, right, front, back), giving denser coverage and enabling placements
+    inside the bounding box of hollow/non-rectangular items.
   - Gravity Z is computed for every (x,y) candidate, not just the pre-stored Z.
   - Score favours low Z first (gravity), then low Y, then low X (fill front-left-bottom).
   - Clearance inflation is applied symmetrically; dunnage logs are drawn inside
     that clearance gap and correctly aligned to the actual (non-inflated) item.
+  - Mesh-based collision detection (via trimesh/FCL) is used when available so that
+    non-rectangular shapes (I-beams, trusses, angles) can be packed into the real
+    empty space beside/between each other rather than their bounding boxes.
 """
 
 from __future__ import annotations
@@ -17,10 +21,31 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 import numpy as np
+import trimesh
 
 from .assembly import Assembly
 from .container import Container
 from .rotations import axis_aligned_rotations, upright_rotations, fine_z_rotations
+
+# ---------------------------------------------------------------------------
+# Mesh collision support (trimesh + python-fcl)
+# ---------------------------------------------------------------------------
+
+HAS_MESH_COLLISION = False
+try:
+    import trimesh.collision as _tcol
+    _cm_probe = _tcol.CollisionManager()
+    _cm_probe.add_object("probe", trimesh.creation.box([1.0, 1.0, 1.0]))
+    result = _cm_probe.in_collision_single(trimesh.creation.box([1.0, 1.0, 1.0]))
+    # Accept both bool and (bool, ...) tuple return styles across trimesh versions
+    _COLLISION_RESULT_IS_TUPLE = isinstance(result, tuple)
+    HAS_MESH_COLLISION = True
+    del _cm_probe, result
+except Exception:
+    _COLLISION_RESULT_IS_TUPLE = False
+
+if HAS_MESH_COLLISION:
+    import trimesh.collision
 
 log = logging.getLogger(__name__)
 
@@ -141,15 +166,25 @@ def _overlaps_any(pos: np.ndarray, ext: np.ndarray, placed: list[PlacedItem]) ->
 def _candidate_xy_positions(placed: list[PlacedItem]) -> list[tuple[float, float]]:
     """Return all (x, y) boundary positions to try for the next item.
 
-    Builds the Cartesian product of:
-      X-breakpoints: 0 + right face of every placed item
-      Y-breakpoints: 0 + front face of every placed item
+    Builds the Cartesian product of ALL X/Y face boundaries:
+      X-breakpoints: 0 + left face + right face of every placed item
+      Y-breakpoints: 0 + back face + front face of every placed item
 
-    This gives O(n²) positions and eliminates the gap problem caused by
-    sparse extreme-point lists.
+    Including the left/back faces enables trying positions that fall inside
+    another item's bounding box — essential for packing beside non-rectangular
+    shapes (e.g. a beam nestled against the side of a truss profile) when
+    mesh-based collision detection is active.
     """
-    xs = sorted({0.0} | {p.position[0] + p.inflated_extents[0] for p in placed})
-    ys = sorted({0.0} | {p.position[1] + p.inflated_extents[1] for p in placed})
+    xs = sorted(
+        {0.0}
+        | {p.position[0] for p in placed}
+        | {p.position[0] + p.inflated_extents[0] for p in placed}
+    )
+    ys = sorted(
+        {0.0}
+        | {p.position[1] for p in placed}
+        | {p.position[1] + p.inflated_extents[1] for p in placed}
+    )
     return [(x, y) for x in xs for y in ys]
 
 
@@ -267,6 +302,33 @@ def _check_collisions(placed: list[PlacedItem]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Mesh collision helpers
+# ---------------------------------------------------------------------------
+
+def _get_world_mesh(
+    assembly: Assembly,
+    actual_position: np.ndarray,
+    rotation: np.ndarray,
+) -> "trimesh.Trimesh":
+    """Return the assembly mesh transformed to container-space coordinates.
+
+    Args:
+        assembly: Normalized assembly (mesh min-corner at origin).
+        actual_position: Non-inflated min-corner in the container (mm).
+        rotation: 3×3 rotation matrix applied before translation.
+
+    Returns:
+        A copy of the mesh in container frame.
+    """
+    T = np.eye(4)
+    T[:3, :3] = rotation
+    T[:3, 3] = actual_position
+    mesh = assembly.mesh.copy()
+    mesh.apply_transform(T)
+    return mesh
+
+
+# ---------------------------------------------------------------------------
 # Packer
 # ---------------------------------------------------------------------------
 
@@ -308,11 +370,18 @@ class Packer:
         assembly: Assembly,
         rotations: list[np.ndarray],
         placed: list[PlacedItem],
+        cm: Optional["trimesh.collision.CollisionManager"] = None,
     ) -> Optional[PlacedItem]:
         """Find the best (rotation, position) for one assembly instance.
 
         Tries every rotation × every boundary-point (x, y) pair, drops each
         candidate to its gravity Z, then picks the lowest-scoring valid placement.
+
+        When a CollisionManager *cm* is provided the collision check uses actual
+        mesh geometry (via FCL) instead of inflated AABBs, which lets items
+        nestle into the empty space beside/between non-rectangular shapes.
+        The rotated mesh is built once per rotation; only the translation is
+        updated per candidate so FCL BVH construction cost is amortised.
 
         Returns:
             Best PlacedItem, or None if the item cannot fit anywhere.
@@ -326,14 +395,37 @@ class Packer:
             rot_base = self._rot_ext(base, rot)
             inf_ext = self._inflated(rot_base)
 
+            # Pre-build the rotated mesh once for this rotation so that per-
+            # candidate checks only need a translation transform (cheap).
+            if cm is not None:
+                rot_T = np.eye(4)
+                rot_T[:3, :3] = rot
+                rot_mesh = assembly.mesh.copy()
+                rot_mesh.apply_transform(rot_T)
+
             for x, y in candidates:
                 z = _gravity_z(x, y, inf_ext, placed)
                 pos = np.array([x, y, z])
 
                 if not _fits_in_container(pos, inf_ext, self.container):
                     continue
-                if _overlaps_any(pos, inf_ext, placed):
-                    continue
+
+                if cm is not None:
+                    # Mesh-based collision: translate the pre-rotated mesh and
+                    # query FCL.  Pass the translation as a transform matrix so
+                    # FCL can reuse the BVH without re-triangulating.
+                    actual_pos = pos + self.clearance_mm / 2.0
+                    trans_T = np.eye(4)
+                    trans_T[:3, 3] = actual_pos
+                    hit = cm.in_collision_single(rot_mesh, transform=trans_T)
+                    if _COLLISION_RESULT_IS_TUPLE:
+                        hit = hit[0]
+                    if hit:
+                        continue
+                else:
+                    # AABB fallback (when FCL is not installed)
+                    if _overlaps_any(pos, inf_ext, placed):
+                        continue
 
                 sc = self._score(pos)
                 if sc < best_score:
@@ -363,6 +455,18 @@ class Packer:
         unpacked: list[Assembly] = []
         total = len(items)
 
+        # Initialise mesh collision manager once per pack run.
+        # Items are added incrementally as they are placed so the manager
+        # always reflects the current container state.
+        if HAS_MESH_COLLISION:
+            cm: Optional["trimesh.collision.CollisionManager"] = (
+                trimesh.collision.CollisionManager()
+            )
+            log.debug("Mesh collision detection active (FCL)")
+        else:
+            cm = None
+            log.debug("Mesh collision unavailable — using AABB fallback")
+
         for idx, asm in enumerate(items):
             if progress_callback:
                 progress_callback(idx, total)
@@ -375,12 +479,17 @@ class Packer:
                     if not any(np.allclose(r, b, atol=1e-6) for b in rots):
                         rots.append(r)
 
-            item = self._try_place(asm, rots, placed)
+            item = self._try_place(asm, rots, placed, cm)
             if item is None:
                 unpacked.append(asm)
                 log.info("Could not place '%s'", asm.name)
             else:
                 placed.append(item)
+                # Register the placed mesh in the collision manager so future
+                # items are checked against it.
+                if cm is not None:
+                    world_mesh = _get_world_mesh(asm, item.actual_position, item.rotation)
+                    cm.add_object(f"item_{len(placed)}", world_mesh)
                 log.debug("Placed '%s' at %s", asm.name, np.round(item.position, 1))
 
         logs = _insert_dunnage(placed, self.log_cross_mm, self.container)
