@@ -47,14 +47,37 @@ class Viewport3D(QWidget):
         self._selected_idx: Optional[int] = None
         self._result = None
         self._container = None
+        self._box_mode: bool = True        # show bounding boxes instead of mesh
+        self._last_render_args: list = []  # for re-render on mode toggle
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         if HAS_GL:
+            # Toolbar row
+            from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QToolButton
+            toolbar = QHBoxLayout()
+            toolbar.setContentsMargins(4, 2, 4, 2)
+            toolbar.setSpacing(4)
+
+            self._btn_boxes = QPushButton("Box Mode")
+            self._btn_boxes.setCheckable(True)
+            self._btn_boxes.setChecked(True)
+            self._btn_boxes.setFixedHeight(22)
+            self._btn_boxes.setToolTip("Toggle between bounding boxes and actual mesh geometry")
+            self._btn_boxes.setStyleSheet(
+                "QPushButton { background: #2c6fad; color: white; border-radius: 3px; padding: 0 8px; }"
+                "QPushButton:checked { background: #1a4a7a; }"
+                "QPushButton:hover { background: #3a8fd4; }"
+            )
+            self._btn_boxes.toggled.connect(self._on_box_mode_toggled)
+            toolbar.addWidget(self._btn_boxes)
+            toolbar.addStretch()
+            layout.addLayout(toolbar)
+
             self._view = GLViewWidget()
             self._view.setBackgroundColor((0, 0, 0, 255))
-            self._view.setCameraPosition(distance=8000, elevation=25, azimuth=45)
+            self._view.setCameraPosition(distance=8000, elevation=30, azimuth=30)
             self._view.mousePressEvent = self._on_mouse_press
             layout.addWidget(self._view)
         else:
@@ -94,6 +117,7 @@ class Viewport3D(QWidget):
 
         GAP = 1000.0  # mm between containers
         offset_x = 0.0
+        self._last_render_args = results_containers
 
         for result, container in results_containers:
             offset = np.array([offset_x, 0.0, 0.0])
@@ -155,20 +179,30 @@ class Viewport3D(QWidget):
         )
         self._view.addItem(line_item)
 
+    def _on_box_mode_toggled(self, checked: bool) -> None:
+        self._box_mode = checked
+        if self._last_render_args:
+            self.render_multi_results(self._last_render_args)
+
     def _draw_item(self, item: "PlacedItem", idx: int, offset: np.ndarray = None) -> None:
-        """Draw a placed assembly as a coloured solid mesh."""
+        """Draw a placed assembly — bounding box or actual mesh depending on mode."""
         if offset is None:
             offset = np.zeros(3)
-        mesh = item.assembly.mesh.copy()
-
-        t = np.eye(4, dtype=np.float64)
-        t[:3, :3] = item.rotation
-        t[:3, 3] = item.actual_position + offset
-        mesh.apply_transform(t)
-
-        verts = mesh.vertices.astype(np.float32)
-        faces = mesh.faces.astype(np.int32)
         r, g, b, a = item.assembly.color
+
+        if self._box_mode:
+            # Draw the actual (non-inflated) bounding box as a solid
+            pos = item.actual_position + offset
+            ext = item.extents
+            verts, faces = _box_solid(pos, ext)
+        else:
+            mesh = item.assembly.mesh.copy()
+            t = np.eye(4, dtype=np.float64)
+            t[:3, :3] = item.rotation
+            t[:3, 3] = item.actual_position + offset
+            mesh.apply_transform(t)
+            verts = mesh.vertices.astype(np.float32)
+            faces = mesh.faces.astype(np.int32)
 
         colors_arr = np.tile([r, g, b, a], (len(faces), 1)).astype(np.float32)
 

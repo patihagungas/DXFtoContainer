@@ -275,6 +275,8 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(lambda cur, tot: self.progress_bar.setValue(cur))
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     def _on_pack_done(self, results: list) -> None:

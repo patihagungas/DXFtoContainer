@@ -14,7 +14,7 @@ from typing import Optional
 import numpy as np
 import trimesh
 
-from .dxf_loader import load_dxf
+from .dxf_loader import load_dxf, load_dxf_components
 
 log = logging.getLogger(__name__)
 
@@ -93,8 +93,14 @@ def _normalize_mesh(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, trimesh.pri
     # Step 3: sort axes longest→X, second→Y, shortest→Z
     extents = mesh.bounding_box.extents
     order = np.argsort(-extents)          # descending index
+    perm = np.eye(3, dtype=np.float64)[order]
+    # Permutation matrices with an odd number of swaps have det=-1 (improper
+    # rotation / reflection).  A reflected mesh renders inside-out in OpenGL.
+    # Fix by negating one column so det becomes +1, then re-translate below.
+    if np.linalg.det(perm) < 0:
+        perm[:, 0] = -perm[:, 0]
     axis_swap = np.eye(4, dtype=np.float64)
-    axis_swap[:3, :3] = np.eye(3)[order]
+    axis_swap[:3, :3] = perm
     mesh.apply_transform(axis_swap)
 
     # Translate so the mesh sits in the positive octant (min corner at origin)
@@ -162,3 +168,65 @@ def load_assembly(
         normalization_transform=norm_transform,
         color=color,
     )
+
+
+def load_assembly_components(
+    filepath: str | Path,
+    name: Optional[str] = None,
+    quantity: int = 1,
+    weight_kg: Optional[float] = None,
+    allow_tipping: bool = False,
+    color: tuple[float, float, float, float] = (0.4, 0.6, 1.0, 0.85),
+) -> list[Assembly]:
+    """Load a DXF file and return one Assembly per connected component.
+
+    If the DXF contains a single part the result is a one-element list
+    (identical behaviour to load_assembly).  If the DXF is an assembly of
+    several disconnected parts, each part is returned as its own Assembly
+    so the packer can place them individually — eliminating the wasted space
+    that comes from reserving the whole assembly's bounding box.
+
+    Args:
+        filepath: Path to the .dxf file.
+        name: Base display name; components are suffixed _p1, _p2, … when
+              there is more than one.
+        quantity: Applied to every component.
+        weight_kg: Optional per-component weight (split equally if desired).
+        allow_tipping: Passed through to every component.
+        color: Base RGBA colour — used as-is for all components.
+
+    Returns:
+        List of Assembly objects, one per disconnected component.
+    """
+    filepath = Path(filepath)
+    if name is None:
+        name = filepath.stem
+
+    components = load_dxf_components(filepath)
+    assemblies: list[Assembly] = []
+
+    for i, raw_mesh in enumerate(components):
+        part_name = name if len(components) == 1 else f"{name}_p{i + 1}"
+        norm_mesh, obb, norm_transform = _normalize_mesh(raw_mesh)
+        aabb = norm_mesh.bounding_box
+
+        log.info(
+            "Component '%s' normalized: extents=%s",
+            part_name,
+            np.round(aabb.extents, 1),
+        )
+
+        assemblies.append(Assembly(
+            name=part_name,
+            filepath=filepath,
+            mesh=norm_mesh,
+            aabb=aabb,
+            obb=obb,
+            quantity=quantity,
+            weight_kg=weight_kg,
+            allow_tipping=allow_tipping,
+            normalization_transform=norm_transform,
+            color=color,
+        ))
+
+    return assemblies

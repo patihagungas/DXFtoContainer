@@ -163,29 +163,42 @@ def _overlaps_any(pos: np.ndarray, ext: np.ndarray, placed: list[PlacedItem]) ->
 # Candidate position generation (boundary-point grid)
 # ---------------------------------------------------------------------------
 
+_MAX_CANDIDATES = 200  # cap to keep placement O(N) not O(N²)
+
+
 def _candidate_xy_positions(placed: list[PlacedItem]) -> list[tuple[float, float]]:
-    """Return all (x, y) boundary positions to try for the next item.
+    """Return (x, y) boundary positions to try for the next item.
 
-    Builds the Cartesian product of ALL X/Y face boundaries:
-      X-breakpoints: 0 + left face + right face of every placed item
-      Y-breakpoints: 0 + back face + front face of every placed item
-
-    Including the left/back faces enables trying positions that fall inside
-    another item's bounding box — essential for packing beside non-rectangular
-    shapes (e.g. a beam nestled against the side of a truss profile) when
-    mesh-based collision detection is active.
+    Builds the Cartesian product of X/Y face boundaries, then caps at
+    _MAX_CANDIDATES by keeping only right/front faces (the most useful ones)
+    when the grid would otherwise be too large.
     """
-    xs = sorted(
-        {0.0}
-        | {p.position[0] for p in placed}
-        | {p.position[0] + p.inflated_extents[0] for p in placed}
+    xs_right = sorted(
+        {0.0} | {p.position[0] + p.inflated_extents[0] for p in placed}
     )
-    ys = sorted(
-        {0.0}
-        | {p.position[1] for p in placed}
-        | {p.position[1] + p.inflated_extents[1] for p in placed}
+    ys_front = sorted(
+        {0.0} | {p.position[1] + p.inflated_extents[1] for p in placed}
     )
-    return [(x, y) for x in xs for y in ys]
+    candidates = [(x, y) for x in xs_right for y in ys_front]
+
+    # If still within budget, also add left/back faces for denser coverage
+    if len(candidates) <= _MAX_CANDIDATES:
+        xs_all = sorted(
+            {0.0}
+            | {p.position[0] for p in placed}
+            | {p.position[0] + p.inflated_extents[0] for p in placed}
+        )
+        ys_all = sorted(
+            {0.0}
+            | {p.position[1] for p in placed}
+            | {p.position[1] + p.inflated_extents[1] for p in placed}
+        )
+        candidates = [(x, y) for x in xs_all for y in ys_all]
+        if len(candidates) > _MAX_CANDIDATES:
+            # Too many — fall back to right/front only
+            candidates = [(x, y) for x in xs_right for y in ys_front]
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------

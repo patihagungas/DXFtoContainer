@@ -170,3 +170,56 @@ def load_dxf(filepath: str | Path) -> trimesh.Trimesh:
         len(mesh.vertices), len(mesh.faces), mesh.bounding_box.extents
     )
     return mesh
+
+
+def load_dxf_components(
+    filepath: str | Path,
+    min_size_mm: float = 50.0,
+) -> list[trimesh.Trimesh]:
+    """Load a DXF file and return each disconnected part as a separate Trimesh.
+
+    Splits the combined mesh into connected components so that individual
+    parts of an assembly are packed independently rather than as one large
+    bounding box.  Components whose largest dimension is smaller than
+    *min_size_mm* (fasteners, bolts, etc.) are merged back into the largest
+    component so they don't inflate the item count.
+
+    Args:
+        filepath: Path to the .dxf file.
+        min_size_mm: Components with max(extents) < this value are dropped
+                     (they are hardware-level detail, not packable parts).
+
+    Returns:
+        List of Trimesh objects, one per significant connected component.
+        Falls back to a single-element list if splitting fails.
+
+    Raises:
+        ValueError, FileNotFoundError, ezdxf.DXFError: same as load_dxf().
+    """
+    full_mesh = load_dxf(filepath)
+    try:
+        components = full_mesh.split(only_watertight=False)
+        if hasattr(components, "geometry"):
+            components = list(components.geometry.values())
+        components = [c for c in components if isinstance(c, trimesh.Trimesh) and len(c.faces) > 0]
+    except Exception as exc:
+        log.warning("Could not split mesh into components: %s - using whole mesh", exc)
+        return [full_mesh]
+
+    if not components:
+        return [full_mesh]
+
+    # Filter out tiny components (fasteners, washers, etc.)
+    significant = [c for c in components if c.bounding_box.extents.max() >= min_size_mm]
+    if not significant:
+        significant = [max(components, key=lambda c: c.bounding_box.extents.max())]
+
+    dropped = len(components) - len(significant)
+    if dropped:
+        log.info(
+            "Dropped %d tiny component(s) (< %.0f mm) from %s",
+            dropped, min_size_mm, Path(filepath).name,
+        )
+
+    log.info("Split into %d component(s) from %s", len(significant), Path(filepath).name)
+    return significant
